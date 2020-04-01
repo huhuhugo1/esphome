@@ -22,6 +22,19 @@
 namespace esphome {
 namespace esp32_ble_tracker {
 
+static bool cmp_addrs(const esp_bd_addr_t& a, const esp_bd_addr_t& b) {
+  return memcmp(a, b, ESP_BD_ADDR_LEN) == 0;
+}
+
+static bool cmp_uuids(const esp_bt_uuid_t& a, const esp_bt_uuid_t& b) {
+  if (a.len != b.len) return false;
+  switch (a.len) {
+    case ESP_UUID_LEN_16: return a.uuid.uuid16 == b.uuid.uuid16;
+    case ESP_UUID_LEN_32: return a.uuid.uuid32 == b.uuid.uuid32;
+    default: return memcmp(a.uuid.uuid128, b.uuid.uuid128, ESP_UUID_LEN_128) == 0;
+  }
+}
+
 static const char *TAG = "esp32_ble_tracker";
 
 ESP32BLETracker *global_esp32_ble_tracker = nullptr;
@@ -75,7 +88,7 @@ void ESP32BLETracker::loop() {
 
       if (!found) {
         for (auto *client : this->clients_) {
-          if (client->get_server_address() == param.bda && !client->is_connected()) {            
+          if (cmp_addrs(client->get_server_address(), param.bda) && !client->is_connected()) {            
             client->open(param);
             found = true;
           }
@@ -216,6 +229,7 @@ void ESP32BLETracker::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_i
   /* If event is register event, store the gattc_if for each profile */
   if (event == ESP_GATTC_REG_EVT) {
     if (param->reg.status == ESP_GATT_OK) {
+      // Create mapping between app id and interface id
       global_esp32_ble_tracker->clients_[param->reg.app_id]->gattc_if = gattc_if;
     } else {
       return;
@@ -232,6 +246,10 @@ void ESP32BLETracker::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_i
 
 bool ESPBTClient::open(esp_ble_gap_cb_param_t::ble_scan_result_evt_param &param) {
   ESP_LOGI(TAG, __FUNCTION__);
+  if (!init()) {
+    ESP_LOGI(TAG, "Empty subscribed services");
+    return false;
+  }
   global_esp32_ble_tracker->pause_scan();
   esp_err_t open_ret = esp_ble_gattc_open(gattc_if, param.bda, param.ble_addr_type, true);
   if (open_ret) {
@@ -243,225 +261,236 @@ bool ESPBTClient::open(esp_ble_gap_cb_param_t::ble_scan_result_evt_param &param)
   return false;
 }
 
-void ESPBTClient::connect_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(TAG, __FUNCTION__);
-  esp_err_t mtu_ret = esp_ble_gattc_send_mtu_req (gattc_if, param->connect.conn_id);
-  if (mtu_ret) {
-    ESP_LOGE(GATTC_TAG, "config MTU error, error code = %x", mtu_ret);
-  }
+void ESPBTClient::reg_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    ESP_LOGI(GATTC_TAG, "REG_EVT");
+    //esp_err_t scan_ret = esp_ble_gap_set_scan_params(&ble_scan_params);
+    //if (scan_ret) {
+    //    ESP_LOGE(GATTC_TAG, "set scan params error, error code = %x", scan_ret);
+    //}
 }
 
-void ESPBTClient::open_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(TAG, __FUNCTION__);
-  if (param->open.status != ESP_GATT_OK) {
-    ESP_LOGE(GATTC_TAG, "open failed, status %d", param->open.status);
-    return;
-  }
-  ESP_LOGI(GATTC_TAG, "open success");
-  global_esp32_ble_tracker->resume_scan();
-}
-
-void ESPBTClient::cfg_mtu_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(TAG, __FUNCTION__);
-  if (param->cfg_mtu.status != ESP_GATT_OK) {
-    ESP_LOGE(GATTC_TAG,"config mtu failed, error status = %x", param->cfg_mtu.status);
-  }
-
-  searched_service = subscribed.begin();
-  if (searched_service != subscribed.end()) {
-    auto& service_uuid = searched_service->first;
-    esp_ble_gattc_search_service(gattc_if, param->cfg_mtu.conn_id, (esp_bt_uuid_t*)&service_uuid);
-  }
-}
-
-void ESPBTClient::search_res_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(TAG, __FUNCTION__);
-  auto service = subscribed.find(param->search_res.srvc_id.uuid);
-  if (service != subscribed.end()) {
-    service->second.get_server = true;
-    service->second.start_handle = param->search_res.start_handle;
-    service->second.end_handle = param->search_res.end_handle;
-  } else {
-    ESP_LOGW(GATTC_TAG,"search response to unknow service");
-  }
-}
-
-void ESPBTClient::search_cmpl_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(TAG, __FUNCTION__);
-  if (param->search_cmpl.status != ESP_GATT_OK){
-    ESP_LOGW(GATTC_TAG, "search service failed, error status = %x", param->search_cmpl.status);
-  }
-  
-  const esp_bt_uuid_t& service_uuid = this->searched_service_it->first;
-  Service& service = this->searched_service_it->second;
-  
-  this->searched_service_it++;
-  if (this->searched_service_it != this->subscribed.end()) {
-    auto& searched_service_uuid = this->searched_service_it->first;
-    esp_ble_gattc_search_service(gattc_if, param->search_cmpl.conn_id, (esp_bt_uuid_t*)&searched_service_uuid);
-  }
-
-  if (service.get_server) {
-    uint16_t count = 1;
-    esp_gattc_char_elem_t char_elem_result;
-
-    for (auto char_it = service.characteristics.begin(); char_it != service.characteristics.end(); ++char_it) {
-      auto status = esp_ble_gattc_get_char_by_uuid( gattc_if,
-                                                    param->search_cmpl.conn_id,
-                                                    service.start_handle,
-                                                    service.end_handle,
-                                                    char_it->first,
-                                                    &char_elem_result,
-                                                    &count);
-      
-      if (status != ESP_GATT_OK) {
-        ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_char_by_uuid error");
-      }
-
-      if (count != 0 && char_elem_result.properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
-        service->second.characteristics[char_elem_result.uuid].handle = char_elem_result.char_handle;
-        esp_ble_gattc_register_for_notify (gattc_if, this->remote_bda, char_elem_result.char_handle);
-      }
+void ESPBTClient::connect_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    ESP_LOGI(GATTC_TAG, "REMOTE BDA:"); esp_log_buffer_hex(GATTC_TAG, g_remote_bda, sizeof(esp_bd_addr_t));
+    ESP_LOGI(GATTC_TAG, "ESP_GATTC_CONNECT_EVT conn_id %d, if %d", param->connect.conn_id, gattc_if);
+    g_conn_id = param->connect.conn_id;
+    memcpy(g_remote_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+    ESP_LOGI(GATTC_TAG, "REMOTE BDA:");
+    esp_log_buffer_hex(GATTC_TAG, g_remote_bda, sizeof(esp_bd_addr_t));
+    esp_err_t mtu_ret = esp_ble_gattc_send_mtu_req (gattc_if, param->connect.conn_id);
+    if (mtu_ret){
+        ESP_LOGE(GATTC_TAG, "config MTU error, error code = %x", mtu_ret);
     }
-  }
 }
 
-void ESPBTClient::reg_for_notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  ESP_LOGI(GATTC_TAG, "ESP_GATTC_REG_FOR_NOTIFY_EVT");
-  if (param->reg_for_notify.status != ESP_GATT_OK){
-    ESP_LOGE(GATTC_TAG, "REG FOR NOTIFY failed: error status = %d", param->reg_for_notify.status);
-  }
-  
-  else{
-    uint16_t count = 0;
-    uint16_t notify_en = 1;
-    auto service = subscribed.find(param->search_res.srvc_id.uuid);
-    esp_gatt_status_t ret_status = esp_ble_gattc_get_attr_count( gattc_if,
-                                  this->conn_id,
-                                  ESP_GATT_DB_DESCRIPTOR,
-                                  service->second.start_handle,
-                                  service->second.end_handle,
-                                  service->second.char_handle,
-                                  &count);
-    if (ret_status != ESP_GATT_OK){
-      ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_attr_count error");
+void ESPBTClient::open_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    global_esp32_ble_tracker->resume_scan();
+    if (param->open.status != ESP_GATT_OK){
+        ESP_LOGE(GATTC_TAG, "open failed, status %d", param->open.status);
+        return;
     }
-    if (count > 0){
-      esp_gattc_descr_elem_t *descr_elem_result = (esp_gattc_descr_elem_t*) malloc(sizeof(esp_gattc_descr_elem_t) * count);
-      if (!descr_elem_result){
-        ESP_LOGE(GATTC_TAG, "malloc error, gattc no mem");
-      }else{
-        ret_status = esp_ble_gattc_get_descr_by_char_handle( gattc_if,
-                                  this->conn_id,
-                                  param->reg_for_notify.handle,
-                                  notify_descr_uuid,
-                                  descr_elem_result,
-                                  &count);
-        if (ret_status != ESP_GATT_OK){
-          ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_descr_by_char_handle error");
+    ESP_LOGI(GATTC_TAG, "open success");
+}
+
+void ESPBTClient::cfg_mtu_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    if (param->cfg_mtu.status != ESP_GATT_OK){
+        ESP_LOGE(GATTC_TAG,"config mtu failed, error status = %x", param->cfg_mtu.status);
+    }
+    ESP_LOGI(GATTC_TAG, "ESP_GATTC_CFG_MTU_EVT, Status %d, MTU %d, conn_id %d", param->cfg_mtu.status, param->cfg_mtu.mtu, param->cfg_mtu.conn_id);
+    esp_ble_gattc_search_service(gattc_if, param->cfg_mtu.conn_id, (esp_bt_uuid_t*)&this->current_service());
+}
+
+void ESPBTClient::search_res_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    ESP_LOGI(GATTC_TAG, "SEARCH RES: conn_id = %x is primary service %d", param->search_res.conn_id, param->search_res.is_primary);
+    ESP_LOGI(GATTC_TAG, "start handle %d end handle %d current handle value %d", param->search_res.start_handle, param->search_res.end_handle, param->search_res.srvc_id.inst_id);
+    if (cmp_uuids(param->search_res.srvc_id.uuid, this->current_service())) {
+        ESP_LOGI(GATTC_TAG, "service found");
+        get_server = true;
+        g_service_start_handle = param->search_res.start_handle;
+        g_service_end_handle = param->search_res.end_handle;
+        ESP_LOGI(GATTC_TAG, "UUID16: %x", param->search_res.srvc_id.uuid.uuid.uuid16);
+    }
+}
+
+void ESPBTClient::reg(esp_bt_uuid_t char_uuid, esp_gatt_if_t gattc_if, uint16_t conn_id) {
+    if (get_server){
+        uint16_t count = 1;
+
+        if (count > 0){
+            char_elem_result = new esp_gattc_char_elem_t[count];
+            if (!char_elem_result){
+                ESP_LOGE(GATTC_TAG, "gattc no mem");
+            }else{
+                esp_gatt_status_t status = esp_ble_gattc_get_char_by_uuid( gattc_if,
+                                                            conn_id,
+                                                            g_service_start_handle,
+                                                            g_service_end_handle,
+                                                            char_uuid,
+                                                            char_elem_result,
+                                                            &count);
+                if (status != ESP_GATT_OK){
+                    ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_char_by_uuid error");
+                }
+                
+                ESP_LOGI(GATTC_TAG, "count %d", (int)count);
+                /*  Every service have only one char in our 'ESP_GATTS_DEMO' demo, so we used first 'char_elem_result' */
+                if (count > 0 && (char_elem_result[0].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)){
+                    g_char_handle = char_elem_result[0].char_handle;
+                    this->callbacks.emplace(g_char_handle, current_callback());
+                    esp_ble_gattc_register_for_notify (gattc_if, g_remote_bda, char_elem_result[0].char_handle);
+                }
+            }
+            /* free char_elem_result */
+            delete[] char_elem_result;
+        }else{
+            ESP_LOGE(GATTC_TAG, "no char found");
         }
-        /* Every char has only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' */
-        if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG){
-          ret_status = (esp_gatt_status_t)esp_ble_gattc_write_char_descr( gattc_if,
-                                this->conn_id,
-                                descr_elem_result[0].handle,
-                                sizeof(notify_en),
-                                (uint8_t *)&notify_en,
+    } else {
+        ESP_LOGI(GATTC_TAG, "NOT SERVER");
+    }
+}
+
+void ESPBTClient::reg_for_notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    ESP_LOGI(GATTC_TAG, "ESP_GATTC_REG_FOR_NOTIFY_EVT");
+    if (param->reg_for_notify.status != ESP_GATT_OK){
+        ESP_LOGE(GATTC_TAG, "REG FOR NOTIFY failed: error status = %d", param->reg_for_notify.status);
+    }else{
+        uint16_t count = 1;
+        uint16_t notify_en = 1;
+        esp_gatt_status_t ret_status = esp_ble_gattc_get_attr_count( gattc_if,
+                                                                        g_conn_id,
+                                                                        ESP_GATT_DB_DESCRIPTOR,
+                                                                        g_service_start_handle,
+                                                                        g_service_end_handle,
+                                                                        g_char_handle,
+                                                                        &count);
+        if (ret_status != ESP_GATT_OK){
+            ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_attr_count error");
+        }
+        if (count > 0){
+            descr_elem_result = new esp_gattc_descr_elem_t[count];
+            if (!descr_elem_result){
+                ESP_LOGE(GATTC_TAG, "malloc error, gattc no mem");
+            }else{
+                static const esp_bt_uuid_t notify_descr_uuid = {
+                    .len = ESP_UUID_LEN_16,
+                    .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,},
+                };
+                
+                ret_status = esp_ble_gattc_get_descr_by_char_handle( gattc_if,
+                                                                        g_conn_id,
+                                                                        param->reg_for_notify.handle,
+                                                                        notify_descr_uuid,
+                                                                        descr_elem_result,
+                                                                        &count);
+                if (ret_status != ESP_GATT_OK){
+                    ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_descr_by_char_handle error");
+                }
+                /* Every char has only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' */
+                if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG){
+                    ret_status = (esp_gatt_status_t) esp_ble_gattc_write_char_descr( gattc_if,
+                                                                    g_conn_id,
+                                                                    descr_elem_result[0].handle,
+                                                                    sizeof(notify_en),
+                                                                    (uint8_t *)&notify_en,
+                                                                    ESP_GATT_WRITE_TYPE_RSP,
+                                                                    ESP_GATT_AUTH_REQ_NONE);
+                }
+
+                if (ret_status != ESP_GATT_OK){
+                    ESP_LOGE(GATTC_TAG, "esp_ble_gattc_write_char_descr error");
+                }
+
+                /* free descr_elem_result */
+                delete[] descr_elem_result;
+            }
+        }
+        else{
+            ESP_LOGE(GATTC_TAG, "decsr not found");
+        }
+
+    }
+}
+
+void ESPBTClient::notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    if (param->notify.is_notify){
+        ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive notify value:");
+    }else{
+        ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive indicate value:");
+    }
+    callbacks[param->notify.handle](); //TODO
+    esp_log_buffer_hex(GATTC_TAG, param->notify.value, param->notify.value_len);
+}
+
+void ESPBTClient::write_descr_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    if (param->write.status != ESP_GATT_OK){
+        ESP_LOGE(GATTC_TAG, "write descr failed, error status = %x", param->write.status);
+        return;
+    }
+    ESP_LOGI(GATTC_TAG, "write descr success ");
+    uint8_t write_char_data[35];
+    for (int i = 0; i < sizeof(write_char_data); ++i)
+    {
+        write_char_data[i] = i % 256;
+    }
+    esp_ble_gattc_write_char( gattc_if,
+                                g_conn_id,
+                                g_char_handle,
+                                sizeof(write_char_data),
+                                write_char_data,
                                 ESP_GATT_WRITE_TYPE_RSP,
                                 ESP_GATT_AUTH_REQ_NONE);
-        }
-
-        if (ret_status != ESP_GATT_OK){
-          ESP_LOGE(GATTC_TAG, "esp_ble_gattc_write_char_descr error");
-        }
-
-        /* free descr_elem_result */
-        free(descr_elem_result);
-      }
-    }
-    else{
-      ESP_LOGE(GATTC_TAG, "decsr not found");
-    }
-
-  }
 }
 
-void ESPBTClient::notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {  
-  if (param->notify.is_notify){
-    ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive notify value:");
-  }else{
-    ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive indicate value:");
-  }
-  esp_log_buffer_hex(GATTC_TAG, param->notify.value, param->notify.value_len);
-  break;
+void ESPBTClient::srvc_chg_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    esp_bd_addr_t bda;
+    memcpy(bda, param->srvc_chg.remote_bda, sizeof(esp_bd_addr_t));
+    ESP_LOGI(GATTC_TAG, "ESP_GATTC_SRVC_CHG_EVT, bd_addr:");
+    esp_log_buffer_hex(GATTC_TAG, bda, sizeof(esp_bd_addr_t));
 }
 
-void ESPBTClient::write_descr_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  if (param->write.status != ESP_GATT_OK){
-    ESP_LOGE(GATTC_TAG, "write descr failed, error status = %x", param->write.status);
-    break;
-  }
-  ESP_LOGI(GATTC_TAG, "write descr success ");
-  uint8_t write_char_data[35];
-  for (int i = 0; i < sizeof(write_char_data); ++i)
-  {
-    write_char_data[i] = i % 256;
-  }
-  esp_ble_gattc_write_char( gattc_if,
-                this->conn_id,
-                this->char_handle,
-                sizeof(write_char_data),
-                write_char_data,
-                ESP_GATT_WRITE_TYPE_RSP,
-                ESP_GATT_AUTH_REQ_NONE);
+void ESPBTClient::write_char_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    if (next_characteristic()) {
+        reg(current_characteristic(), gattc_if, param->write.conn_id);
+    }
+    if (param->write.status != ESP_GATT_OK){
+        ESP_LOGE(GATTC_TAG, "write char failed, error status = %x", param->write.status);
+        return;
+    }
+    ESP_LOGI(GATTC_TAG, "write char success ");
+}
+
+void ESPBTClient::disconnect_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    connected = false;
+    get_server = false;
+    ESP_LOGI(GATTC_TAG, "ESP_GATTC_DISCONNECT_EVT, reason = %d", param->disconnect.reason);
 }
 
 void ESPBTClient::handle_event(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-  const static esp_bt_uuid_t notify_descr_uuid = {
-      .len = ESP_UUID_LEN_16,
-      .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,},
-  };
-
   switch (event) {
-    case ESP_GATTC_CONNECT_EVT: 
-      this->connect_handler(gattc_if, param); break;
-    case ESP_GATTC_OPEN_EVT:   
-      this->open_handler(gattc_if, param); break;
-    case ESP_GATTC_CFG_MTU_EVT: 
-      this->cfg_mtu_handler(gattc_if, param); break;
-    case ESP_GATTC_SEARCH_RES_EVT: 
-      this->search_res_handler(gattc_if, param); break;
-    case ESP_GATTC_SEARCH_CMPL_EVT: 
-      this->search_cmpl_handler(gattc_if, param); break;
-    case ESP_GATTC_REG_FOR_NOTIFY_EVT: 
-      this->reg_for_notify_handler(gattc_if, param); break;
+    case ESP_GATTC_REG_EVT: 
+      this->reg_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_CONNECT_EVT:
+      this->connect_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_OPEN_EVT:
+      this->open_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_CFG_MTU_EVT:
+      this->cfg_mtu_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_SEARCH_RES_EVT:
+      this->search_res_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_SEARCH_CMPL_EVT:
+      this->reg(current_characteristic(), gattc_if, param->search_cmpl.conn_id); break;
+    case ESP_GATTC_REG_FOR_NOTIFY_EVT:
+      this->reg_for_notify_evt_handle(gattc_if, param); break;
     case ESP_GATTC_NOTIFY_EVT:
-      this->notify_handler(gattc_if, param); break;
+      this->notify_evt_handle(gattc_if, param); break;
     case ESP_GATTC_WRITE_DESCR_EVT:
-      this->write_descr_handler(gattc_if, param); break;
-
-    case ESP_GATTC_SRVC_CHG_EVT: {
-      esp_bd_addr_t bda;
-      memcpy(bda, param->srvc_chg.remote_bda, sizeof(esp_bd_addr_t));
-      ESP_LOGI(GATTC_TAG, "ESP_GATTC_SRVC_CHG_EVT, bd_addr:");
-      esp_log_buffer_hex(GATTC_TAG, bda, sizeof(esp_bd_addr_t));
-      break;
-    }
-
+      this->write_descr_evt_handle(gattc_if, param); break;
+    case ESP_GATTC_SRVC_CHG_EVT:
+      this->srvc_chg_evt_handle(gattc_if, param); break;
     case ESP_GATTC_WRITE_CHAR_EVT:
-      if (param->write.status != ESP_GATT_OK){
-        ESP_LOGE(GATTC_TAG, "write char failed, error status = %x", param->write.status);
-        break;
-      }
-      ESP_LOGI(GATTC_TAG, "write char success ");
-      break;
-
+      this->write_char_evt_handle(gattc_if, param); break;
     case ESP_GATTC_DISCONNECT_EVT:
-      connected = false;
-      get_server = false;
-      ESP_LOGI(GATTC_TAG, "ESP_GATTC_DISCONNECT_EVT, reason = %d", param->disconnect.reason);
-      break;
-
+      this->disconnect_evt_handle(gattc_if, param); break;
     default:
       break;
   }

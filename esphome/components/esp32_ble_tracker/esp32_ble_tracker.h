@@ -143,40 +143,97 @@ struct uuid_hash {
 struct ESPBTClient {
   uint16_t gattc_if = ESP_GATT_IF_NONE;
 
-  std::unordered_map<esp_bt_uuid_t, 
-    std::unordered_map<esp_bt_uuid_t,
-      std::function<void()>,
-      uuid_hash,uuid_hash>, 
-    uuid_hash,uuid_hash> subscribed;
+  using notify_cb = std::function<void()>;
+  using characteristic_map = std::unordered_map<esp_bt_uuid_t, notify_cb, uuid_hash, uuid_hash>;
+  using service_map = std::unordered_map<esp_bt_uuid_t, characteristic_map, uuid_hash, uuid_hash>;
+  
+  service_map subscribed;
+  std::unordered_map<uint16_t, notify_cb> callbacks;
 
-  auto searched_service = subscribed.begin();
+  service_map::iterator processed_service_it;
+  characteristic_map::iterator processed_characteristic_it;
+  
+  bool init() {
+    esp_bt_uuid_t remote_filter_service_uuid = {
+      .len = ESP_UUID_LEN_128,
+      .uuid = {.uuid128 = {0x42, 0x00, 0x74, 0xa9, 0xff, 0x52, 0x10, 0x9b, 0x33, 0x49, 0x35, 0x9b, 0x00, 0x02, 0x68, 0xef},},
+    };
 
-  void subscribe(esp_bt_uuid_t service_uuid, esp_bt_uuid_t characteristic_uuid, std::function<void()> cb) {
-    if (subscribed.count(service_uuid) == 0)
-      subscribed.emplace(service_uuid);
+    esp_bt_uuid_t remote_filter_char_uuid = {
+      .len = ESP_UUID_LEN_128,
+      .uuid = {.uuid128 = {0x42, 0x00, 0x74, 0xa9, 0xff, 0x52, 0x10, 0x9b, 0x33, 0x49, 0x35, 0x9b, 0x01, 0x02, 0x68, 0xef},},
+    };
+
+    esp_bt_uuid_t remote_filter_char_uuid_2 = {
+      .len = ESP_UUID_LEN_128,
+      .uuid = {.uuid128 = {0x42, 0x00, 0x74, 0xa9, 0xff, 0x52, 0x10, 0x9b, 0x33, 0x49, 0x35, 0x9b, 0x02, 0x02, 0x68, 0xef},},
+    };
     
-    auto& characteristics = subscribed[service_uuid].characteristics;
+    subscribe(remote_filter_service_uuid, remote_filter_char_uuid, []() {ESP_LOGI("TEST", "teplota");});
+    subscribe(remote_filter_service_uuid, remote_filter_char_uuid_2, []() {ESP_LOGI("TEST", "tlak");});
+    
+    if (subscribed.size() == 0) return false;
+    processed_service_it = subscribed.begin();
+    processed_characteristic_it = processed_service_it->second.begin();
+    return true;
+  }
+
+  const esp_bt_uuid_t& current_service() { return processed_service_it->first; }
+  const esp_bt_uuid_t& current_characteristic() { return processed_characteristic_it->first; } 
+  const notify_cb& current_callback() { return processed_characteristic_it->second; }
+
+  bool next_service() {
+    ESP_LOGI("TEST", __FUNCTION__);
+    processed_service_it++;
+    return processed_service_it != subscribed.end();
+  }
+  
+  bool next_characteristic() {
+    ESP_LOGI("TEST", __FUNCTION__);
+    processed_characteristic_it++;
+    return processed_characteristic_it != processed_service_it->second.end();
+  }
+
+  void subscribe(const esp_bt_uuid_t& service_uuid, const esp_bt_uuid_t& characteristic_uuid, const notify_cb& cb) {
+    if (subscribed.count(service_uuid) == 0)
+      subscribed.emplace(service_uuid, characteristic_map()); //TODO
+    
+    auto& characteristics = subscribed[service_uuid];
     if (characteristics.count(characteristic_uuid) == 0)
       characteristics.emplace(characteristic_uuid, cb);
   }
 
   bool connected  = false;
   bool get_server = false;
-  const esp_bd_addr_t server_address;
+  esp_gattc_char_elem_t *char_elem_result   = NULL;
+  esp_gattc_descr_elem_t *descr_elem_result = NULL;
+
+  uint16_t g_conn_id;
+  uint16_t g_service_start_handle;
+  uint16_t g_service_end_handle;
+  uint16_t g_char_handle;
+  esp_bd_addr_t g_remote_bda;
+
+  /*TODOconst*/ esp_bd_addr_t server_address = {0xC4, 0xF3, 0xE8, 0xDA, 0xBF, 0x5A};
   ESP32BLETracker *parent_{nullptr};
   void set_parent(ESP32BLETracker *parent) { parent_ = parent; }
 
   const esp_bd_addr_t& get_server_address() { return server_address; }
   bool is_connected() { return connected; }
+  void handle_event(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
   bool open(esp_ble_gap_cb_param_t::ble_scan_result_evt_param &param);
-  void connect_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void open_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void cfg_mtu_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void search_res_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void search_cmpl_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void reg_for_notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-  void write_descr_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void reg_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void connect_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void open_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void cfg_mtu_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void search_res_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void reg(esp_bt_uuid_t char_uuid, esp_gatt_if_t gattc_if, uint16_t conn_id);
+  void reg_for_notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void write_descr_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void srvc_chg_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void write_char_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void disconnect_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
 };
 
 class ESP32BLETracker : public Component {
