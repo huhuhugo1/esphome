@@ -7,7 +7,10 @@
 
 #include <string>
 #include <array>
+#include <unordered_map>
+#include <stdint.h>
 #include <esp_gap_ble_api.h>
+#include <esp_gattc_api.h>
 #include <esp_bt_defs.h>
 
 namespace esphome {
@@ -127,6 +130,55 @@ class ESPBTDeviceListener {
   ESP32BLETracker *parent_{nullptr};
 };
 
+struct uuid_hash {
+  std::size_t operator() (esp_bt_uuid_t const& uuid) const {
+    return std::hash<uint32_t>{}(uuid.uuid.uuid32);
+  }
+
+  bool operator() (esp_bt_uuid_t const& uuid_a, esp_bt_uuid_t const& uuid_b) const {
+    return uuid_a.uuid.uuid32 == uuid_b.uuid.uuid32;
+  }
+};
+
+struct ESPBTClient {
+  uint16_t gattc_if = ESP_GATT_IF_NONE;
+
+  std::unordered_map<esp_bt_uuid_t, 
+    std::unordered_map<esp_bt_uuid_t,
+      std::function<void()>,
+      uuid_hash,uuid_hash>, 
+    uuid_hash,uuid_hash> subscribed;
+
+  auto searched_service = subscribed.begin();
+
+  void subscribe(esp_bt_uuid_t service_uuid, esp_bt_uuid_t characteristic_uuid, std::function<void()> cb) {
+    if (subscribed.count(service_uuid) == 0)
+      subscribed.emplace(service_uuid);
+    
+    auto& characteristics = subscribed[service_uuid].characteristics;
+    if (characteristics.count(characteristic_uuid) == 0)
+      characteristics.emplace(characteristic_uuid, cb);
+  }
+
+  bool connected  = false;
+  bool get_server = false;
+  const esp_bd_addr_t server_address;
+  ESP32BLETracker *parent_{nullptr};
+  void set_parent(ESP32BLETracker *parent) { parent_ = parent; }
+
+  const esp_bd_addr_t& get_server_address() { return server_address; }
+  bool is_connected() { return connected; }
+  bool open(esp_ble_gap_cb_param_t::ble_scan_result_evt_param &param);
+  void connect_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void open_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void cfg_mtu_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void search_res_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void search_cmpl_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void reg_for_notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void notify_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+  void write_descr_handler(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+};
+
 class ESP32BLETracker : public Component {
  public:
   void set_scan_duration(uint32_t scan_duration) { scan_duration_ = scan_duration; }
@@ -145,8 +197,18 @@ class ESP32BLETracker : public Component {
     this->listeners_.push_back(listener);
   }
 
-  void print_bt_device_info(const ESPBTDevice &device);
+  void register_client(ESPBTClient *client) {
+    ESP_LOGI("esp32_ble_tracker", "register_client");
+    client->set_parent(this);
+    int id = this->clients_.size();
+    esp_ble_gattc_app_register(id);
+    this->clients_.push_back(client);
+  }
 
+  void print_bt_device_info(const ESPBTDevice &device);
+  /// Start a single scan by setting up the parameters and doing some esp-idf calls.
+  void pause_scan() { esp_ble_gap_stop_scanning(); };
+  void resume_scan() { xSemaphoreGive(this->scan_end_lock_); };
  protected:
   /// The FreeRTOS task managing the bluetooth interface.
   static bool ble_setup();
@@ -154,6 +216,8 @@ class ESP32BLETracker : public Component {
   void start_scan(bool first);
   /// Callback that will handle all GAP events and redistribute them to other callbacks.
   static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+  /// Callback that will handle all GATTC events and redistribute them to other callbacks.
+  static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
   /// Called when a `ESP_GAP_BLE_SCAN_RESULT_EVT` event is received.
   void gap_scan_result(const esp_ble_gap_cb_param_t::ble_scan_result_evt_param &param);
   /// Called when a `ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT` event is received.
@@ -164,6 +228,7 @@ class ESP32BLETracker : public Component {
   /// Vector of addresses that have already been printed in print_bt_device_info
   std::vector<uint64_t> already_discovered_;
   std::vector<ESPBTDeviceListener *> listeners_;
+  std::vector<ESPBTClient *> clients_;
   /// A structure holding the ESP BLE scan parameters.
   esp_ble_scan_params_t scan_params_;
   /// The interval in seconds to perform scans.
