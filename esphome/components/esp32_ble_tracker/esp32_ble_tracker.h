@@ -169,8 +169,8 @@ struct ESPBTClient {
       .uuid = {.uuid128 = {0x42, 0x00, 0x74, 0xa9, 0xff, 0x52, 0x10, 0x9b, 0x33, 0x49, 0x35, 0x9b, 0x02, 0x02, 0x68, 0xef},},
     };
     
-    subscribe(remote_filter_service_uuid, remote_filter_char_uuid, []() {ESP_LOGI("TEST", "teplota");});
-    subscribe(remote_filter_service_uuid, remote_filter_char_uuid_2, []() {ESP_LOGI("TEST", "tlak");});
+    subscribe(remote_filter_service_uuid, remote_filter_char_uuid, []() {ESP_LOGI("TEST", "tep");});
+//    subscribe(remote_filter_service_uuid, remote_filter_char_uuid_2, []() {ESP_LOGI("TEST", "tlak");});
     
     if (subscribed.size() == 0) return false;
     processed_service_it = subscribed.begin();

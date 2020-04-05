@@ -35,6 +35,14 @@ static bool cmp_uuids(const esp_bt_uuid_t& a, const esp_bt_uuid_t& b) {
   }
 }
 
+static void log_uuid(const esp_bt_uuid_t& uuid) {
+  switch (uuid.len) {
+    case ESP_UUID_LEN_16: ESP_LOGI(GATTC_TAG, "UUID_16: 0x%04x", uuid.uuid.uuid16); break;
+    case ESP_UUID_LEN_32: ESP_LOGI(GATTC_TAG, "UUID_32: 0x%08x", uuid.uuid.uuid32); break;
+    default: ESP_LOGI(GATTC_TAG, "UUID_128: "); esp_log_buffer_hex(GATTC_TAG, uuid.uuid.uuid128, 16);
+  }
+}
+
 static const char *TAG = "esp32_ble_tracker";
 
 ESP32BLETracker *global_esp32_ble_tracker = nullptr;
@@ -130,8 +138,7 @@ bool ESP32BLETracker::ble_setup() {
     ESP_LOGE(TAG, "btStart failed: %d", esp_bt_controller_get_status());
     return false;
   }
-
-  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  //esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
 
   err = esp_bluedroid_init();
   if (err != ESP_OK) {
@@ -196,7 +203,6 @@ void ESP32BLETracker::start_scan(bool first) {
   this->scan_params_.scan_window = this->scan_window_;
 
   esp_ble_gap_set_scan_params(&this->scan_params_);
-  esp_ble_gap_start_scanning(this->scan_duration_);
 
   this->set_timeout("scan", this->scan_duration_ * 2000, []() {
     ESP_LOGW(TAG, "ESP-IDF BLE scan never terminated, rebooting to restore BLE stack...");
@@ -283,7 +289,7 @@ void ESPBTClient::connect_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_pa
 }
 
 void ESPBTClient::open_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
-    global_esp32_ble_tracker->resume_scan();
+    //global_esp32_ble_tracker->resume_scan();
     if (param->open.status != ESP_GATT_OK){
         ESP_LOGE(GATTC_TAG, "open failed, status %d", param->open.status);
         return;
@@ -302,6 +308,7 @@ void ESPBTClient::cfg_mtu_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_pa
 void ESPBTClient::search_res_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
     ESP_LOGI(GATTC_TAG, "SEARCH RES: conn_id = %x is primary service %d", param->search_res.conn_id, param->search_res.is_primary);
     ESP_LOGI(GATTC_TAG, "start handle %d end handle %d current handle value %d", param->search_res.start_handle, param->search_res.end_handle, param->search_res.srvc_id.inst_id);
+    log_uuid(this->current_service());
     if (cmp_uuids(param->search_res.srvc_id.uuid, this->current_service())) {
         ESP_LOGI(GATTC_TAG, "service found");
         get_server = true;
@@ -313,7 +320,18 @@ void ESPBTClient::search_res_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb
 
 void ESPBTClient::reg(esp_bt_uuid_t char_uuid, esp_gatt_if_t gattc_if, uint16_t conn_id) {
     if (get_server){
-        uint16_t count = 1;
+
+        uint16_t count = 0;
+        esp_gatt_status_t status = esp_ble_gattc_get_attr_count( gattc_if,
+                                                                conn_id,
+                                                                ESP_GATT_DB_CHARACTERISTIC,
+                                                                g_service_start_handle,
+                                                                g_service_end_handle,
+                                                                INVALID_HANDLE,
+                                                                &count);
+        if (status != ESP_GATT_OK){
+          ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_attr_count error");
+        }
 
         if (count > 0){
             char_elem_result = new esp_gattc_char_elem_t[count];
@@ -336,7 +354,8 @@ void ESPBTClient::reg(esp_bt_uuid_t char_uuid, esp_gatt_if_t gattc_if, uint16_t 
                 if (count > 0 && (char_elem_result[0].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)){
                     g_char_handle = char_elem_result[0].char_handle;
                     this->callbacks.emplace(g_char_handle, current_callback());
-                    esp_ble_gattc_register_for_notify (gattc_if, g_remote_bda, char_elem_result[0].char_handle);
+                    auto e = esp_ble_gattc_register_for_notify (gattc_if, g_remote_bda, char_elem_result[0].char_handle);
+                    ESP_LOGI(GATTC_TAG, "Notify returns: %d\n", e);
                 }
             }
             /* free char_elem_result */
@@ -354,7 +373,7 @@ void ESPBTClient::reg_for_notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gatt
     if (param->reg_for_notify.status != ESP_GATT_OK){
         ESP_LOGE(GATTC_TAG, "REG FOR NOTIFY failed: error status = %d", param->reg_for_notify.status);
     }else{
-        uint16_t count = 1;
+        uint16_t count = 0;
         uint16_t notify_en = 1;
         esp_gatt_status_t ret_status = esp_ble_gattc_get_attr_count( gattc_if,
                                                                         g_conn_id,
@@ -385,8 +404,9 @@ void ESPBTClient::reg_for_notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gatt
                 if (ret_status != ESP_GATT_OK){
                     ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_descr_by_char_handle error");
                 }
-                /* Every char has only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' */
+                // Every char has only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' 
                 if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG){
+                    ESP_LOGI(GATTC_TAG, "write char descr");
                     ret_status = (esp_gatt_status_t) esp_ble_gattc_write_char_descr( gattc_if,
                                                                     g_conn_id,
                                                                     descr_elem_result[0].handle,
@@ -400,7 +420,7 @@ void ESPBTClient::reg_for_notify_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gatt
                     ESP_LOGE(GATTC_TAG, "esp_ble_gattc_write_char_descr error");
                 }
 
-                /* free descr_elem_result */
+                // free descr_elem_result 
                 delete[] descr_elem_result;
             }
         }
@@ -427,7 +447,7 @@ void ESPBTClient::write_descr_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_c
         return;
     }
     ESP_LOGI(GATTC_TAG, "write descr success ");
-    uint8_t write_char_data[35];
+    /*uint8_t write_char_data[35];
     for (int i = 0; i < sizeof(write_char_data); ++i)
     {
         write_char_data[i] = i % 256;
@@ -438,7 +458,7 @@ void ESPBTClient::write_descr_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_c
                                 sizeof(write_char_data),
                                 write_char_data,
                                 ESP_GATT_WRITE_TYPE_RSP,
-                                ESP_GATT_AUTH_REQ_NONE);
+                                ESP_GATT_AUTH_REQ_NONE);*/
 }
 
 void ESPBTClient::srvc_chg_evt_handle(esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
@@ -498,6 +518,7 @@ void ESPBTClient::handle_event(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_i
 
 void ESP32BLETracker::gap_scan_set_param_complete(const esp_ble_gap_cb_param_t::ble_scan_param_cmpl_evt_param &param) {
   this->scan_set_param_failed_ = param.status;
+  esp_ble_gap_start_scanning(this->scan_duration_);
 }
 
 void ESP32BLETracker::gap_scan_start_complete(const esp_ble_gap_cb_param_t::ble_scan_start_cmpl_evt_param &param) {

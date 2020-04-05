@@ -2,14 +2,14 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
-#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#include "esphome/components/esp32_ble_scanner/esp32_ble_scanner.h"
 
 #ifdef ARDUINO_ARCH_ESP32
 
 namespace esphome {
 namespace nordic {
 
-class Nordic : public Component, public esp32_ble_tracker::ESPBTClient {
+class Nordic : public Component, public esp32_ble_scanner::ESP32BLEClient {
  public:
   //void set_address(uint64_t address) { address_ = address; }
   /*
@@ -30,6 +30,15 @@ class Nordic : public Component, public esp32_ble_tracker::ESPBTClient {
     return true;
   }
   */
+  void setup() override {
+    auto serviceA = "ef680200-9b35-4933-9b10-52ffa9740042";
+    auto char1 = "ef680201-9b35-4933-9b10-52ffa9740042";
+    auto serviceB = "ef680300-9b35-4933-9b10-52ffa9740042";
+    auto char2 = "ef680302-9b35-4933-9b10-52ffa9740042";
+
+    register_callback(serviceA, char1, [](uint8_t*, size_t){ESP_LOGI("TAG", "Teplota");});
+    register_callback(serviceB, char2, [](uint8_t*, size_t){ESP_LOGI("TAG", "Tlacitko");});
+  }
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
   void set_temperature(sensor::Sensor *temperature) { temperature_ = temperature; }
