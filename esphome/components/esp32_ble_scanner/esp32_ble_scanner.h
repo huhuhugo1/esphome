@@ -10,59 +10,64 @@
 
 namespace esphome {
 namespace esp32_ble_scanner {
+using ESP32BLENotificationHandler = std::function<void(uint8_t* data, size_t length)>;
 
-class ESP32BLEClient : public BLEClientCallbacks {
-  using ESP32BLEClientCallback = std::function<void(uint8_t* pData, size_t length)>;
-  
-  static std::unordered_map<uint16_t, ESP32BLEClientCallback> callbacks;
-  static void notifyCallback(BLERemoteCharacteristic*, uint8_t*, size_t, bool);
-
-  bool connected = false;
-  BLEClient* pClient = nullptr;
-  BLEAdvertisedDevice* server = nullptr;
-  std::unordered_map<std::string, std::unordered_map<std::string, ESP32BLEClientCallback>> subscriptions;
- 
+class ESP32BLEClient {
  public:
-  ESP32BLEClient() {
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(this);
-  }
-  
-  void onConnect(BLEClient* pclient) override {}
+  virtual const std::string& get_server_name() const = 0;
+  virtual void set_server_handle(BLEAdvertisedDevice& s) = 0;
+  virtual bool connect_to_server() = 0;
+  virtual bool is_connected() const = 0;
+};
 
-  void onDisconnect(BLEClient* pclient) override {
-    ESP_LOGE("TAG", "Disconnected");
-    connected = false;
-  }
+class ESP32BLENotificationSubscriber : public ESP32BLEClient, public BLEClientCallbacks {
+ public:
+  ESP32BLENotificationSubscriber(const std::string& server_name);
+  const std::string& get_server_name() const override;
+  void set_server_handle(BLEAdvertisedDevice& server_handle) override;
+  bool connect_to_server() override;
+  bool is_connected() const override;
 
-  void set_server(BLEAdvertisedDevice& s) {
-    if (server) delete server;
-    server = new BLEAdvertisedDevice(s);
-  }
+  // BLEClientCallbacks
+  void onConnect(BLEClient* client) override;
+  void onDisconnect(BLEClient* client) override;
 
-  bool connect();
-  bool isConnected() { return connected; }
-  bool isServerSet() { return server; }
-  void register_handlers();
-  void register_callback(const std::string& s_uuid, const std::string& c_uuid, const ESP32BLEClientCallback& cb);
+ protected:
+  void add_notification_handler(const std::string& s_uuid, const std::string& c_uuid, const ESP32BLENotificationHandler& h);
+  void register_all_handlers();
+
+  std::unordered_map<std::string, std::unordered_map<std::string, ESP32BLENotificationHandler>> subscriptions_;
+  std::string const server_name_;
+  BLEClient* const client_;
+  BLEAdvertisedDevice* server_handle_ = nullptr;
+  bool connected_ = false;
+
+  static std::unordered_map<uint16_t, ESP32BLENotificationHandler> handlers_;
+  static void notifyCallback(BLERemoteCharacteristic*, uint8_t*, size_t, bool);
 };
 
 class ESP32BLEScanner: public Component, public BLEAdvertisedDeviceCallbacks {
-  std::unordered_map<std::string, ESP32BLEClient*> registered_clients;
-  std::queue<ESP32BLEClient*> clients_to_be_connected;
-  unsigned long time_of_last_scan;
-  BLEScan* pBLEScan = nullptr;
-  
-  void start_scan();
-
  public:
+  ESP32BLEScanner(int scan_window, int scan_interval, int scan_period, bool scan_active);
   void setup() override;
-  void onResult(BLEAdvertisedDevice advertisedDevice) override;
   void loop() override;
   void dump_config() override;
-  void register_client(const std::string& name, ESP32BLEClient* client);
-};
+  void register_client(ESP32BLEClient* client);
 
+ protected:
+  void start_scan();
+  void onResult(BLEAdvertisedDevice advertisedDevice) override;
+
+  const int scan_window_;
+  const int scan_interval_;
+  const int scan_period_;
+  const bool scan_active_;
+
+  std::unordered_map<std::string, ESP32BLEClient*> registered_clients_;
+  std::queue<ESP32BLEClient*> clients_to_be_connected_;
+  unsigned long time_of_last_scan_;
+  BLEScan* scanner_handle_ = nullptr;
+};
 }  // namespace esp32_ble_scanner
 }  // namespace esphome
 

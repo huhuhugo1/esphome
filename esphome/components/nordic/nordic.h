@@ -9,47 +9,16 @@
 namespace esphome {
 namespace nordic {
 
-class Nordic : public Component, public esp32_ble_scanner::ESP32BLEClient {
+class Nordic : public Component, public esp32_ble_scanner::ESP32BLENotificationSubscriber {
  public:
-  //void set_address(uint64_t address) { address_ = address; }
-  /*
-  bool parse_device(const esp32_ble_tracker::ESPBTDevice &device) override {
-    if (device.address_uint64() != this->address_)
-      return false;
-
-    auto res = xiaomi_ble::parse_xiaomi(device);
-    if (!res.has_value())
-      return false;
-
-    if (res->temperature.has_value() && this->temperature_ != nullptr)
-      this->temperature_->publish_state(*res->temperature);
-    if (res->humidity.has_value() && this->humidity_ != nullptr)
-      this->humidity_->publish_state(*res->humidity);
-    if (res->battery_level.has_value() && this->battery_level_ != nullptr)
-      this->battery_level_->publish_state(*res->battery_level);
-    return true;
-  }
-  */
-  void setup() override {
-    auto serviceA = "ef680200-9b35-4933-9b10-52ffa9740042";
-    auto char1 = "ef680201-9b35-4933-9b10-52ffa9740042";
-    auto serviceB = "ef680300-9b35-4933-9b10-52ffa9740042";
-    auto char2 = "ef680302-9b35-4933-9b10-52ffa9740042";
-
-    register_callback(serviceA, char1, [](uint8_t*, size_t){ESP_LOGI("TAG", "Teplota");});
-    register_callback(serviceB, char2, [](uint8_t*, size_t){ESP_LOGI("TAG", "Tlacitko");});
-  }
+  Nordic(const std::string& server_name);
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
-  void set_temperature(sensor::Sensor *temperature) { temperature_ = temperature; }
-  void set_humidity(sensor::Sensor *humidity) { humidity_ = humidity; }
-  void set_battery_level(sensor::Sensor *battery_level) { battery_level_ = battery_level; }
 
- protected:
-  uint64_t address_;
-  sensor::Sensor *temperature_{nullptr};
-  sensor::Sensor *humidity_{nullptr};
-  sensor::Sensor *battery_level_{nullptr};
+  void set_temperature(sensor::Sensor *temperature);
+  void set_pressure(sensor::Sensor *pressure);
+  void set_humidity(sensor::Sensor *humidity);
+  void set_battery_level(sensor::Sensor *battery_level);
 };
 
 }  // namespace nordic
