@@ -1,4 +1,7 @@
 #include "esp32_ble_scanner.h"
+#include "esphome/core/log.h"
+#include "esphome/core/application.h"
+#include "esphome/core/helpers.h"
 
 #ifdef ARDUINO_ARCH_ESP32
 
@@ -7,8 +10,10 @@ namespace esp32_ble_scanner {
 
 static const char *TAG = "esp32_ble_scanner";
 
-std::unordered_map<uint16_t, ESP32BLENotificationHandler> ESP32BLENotificationSubscriber::handlers_ =
+std::unordered_map<uint16_t, ESP32BLENotificationHandler> ESP32BLEScanner::handlers_ =
   std::unordered_map<uint16_t, ESP32BLENotificationHandler>();
+
+RingBuffer<ESP32BLENotification> ESP32BLEScanner::handlersToCall_ = RingBuffer<ESP32BLENotification>(5);
 
 ESP32BLENotificationSubscriber::ESP32BLENotificationSubscriber(const std::string& server_name):
   server_name_(server_name),
@@ -21,14 +26,13 @@ const std::string& ESP32BLENotificationSubscriber::get_server_name() const {
   return server_name_;
 }
 
-void ESP32BLENotificationSubscriber::set_server_handle(BLEAdvertisedDevice& server_handle) {
-  if (server_handle_) delete server_handle_;
-  server_handle_ = new BLEAdvertisedDevice(server_handle);
+void ESP32BLENotificationSubscriber::set_server_handle(std::unique_ptr<BLEAdvertisedDevice>& server_handle) {
+  server_handle_ = std::move(server_handle);
 }
 
 bool ESP32BLENotificationSubscriber::connect_to_server() {
   ESP_LOGI(TAG, "Connecting to server '%s'...", server_name_.c_str());
-  if (client_->connect(server_handle_)) {
+  if (client_->connect(server_handle_.get())) {
     connected_ = true;
     register_all_handlers();
   } else {
@@ -43,16 +47,12 @@ bool ESP32BLENotificationSubscriber::is_connected() const {
 }
 
 void ESP32BLENotificationSubscriber::onConnect(BLEClient* client) {
-  ESP_LOGI(TAG, "Connected to server '%s'.", server_name_.c_str());
+  //ESP_LOGI(TAG, "Connected to server '%s'.", server_name_.c_str());
 }
 
 void ESP32BLENotificationSubscriber::onDisconnect(BLEClient* client) {
-  ESP_LOGI(TAG, "Disconnected from server '%s'.", server_name_.c_str());
+  //ESP_LOGI(TAG, "Disconnected from server '%s'.", server_name_.c_str());
   connected_ = false;
-}
-
-void ESP32BLENotificationSubscriber::notifyCallback(BLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
-  ESP32BLENotificationSubscriber::handlers_[characteristic->getHandle()](data, length);
 }
 
 void ESP32BLENotificationSubscriber::add_notification_handler(const std::string& s_uuid, const std::string& c_uuid, const ESP32BLENotificationHandler& h) {
@@ -67,8 +67,8 @@ void ESP32BLENotificationSubscriber::register_all_handlers() {
       for (const auto& c: s.second) {
         BLERemoteCharacteristic* remote_characteristic = remote_service->getCharacteristic(c.first);
         if(remote_characteristic && remote_characteristic->canNotify()) {
-          remote_characteristic->registerForNotify(ESP32BLENotificationSubscriber::notifyCallback);
-          ESP32BLENotificationSubscriber::handlers_.emplace(remote_characteristic->getHandle(), c.second);
+          remote_characteristic->registerForNotify(ESP32BLEScanner::onNotify);
+          ESP32BLEScanner::handlers_.emplace(remote_characteristic->getHandle(), c.second);
           if (auto d = remote_characteristic->getDescriptor(BLEUUID((uint16_t)0x2902))) {
             uint16_t en = 1;
             d->writeValue((uint8_t*)&en, 2, true);
@@ -97,14 +97,29 @@ void ESP32BLEScanner::setup() {
 }
 
 void ESP32BLEScanner::loop() {
-  if (!clients_to_be_connected_.empty()) {
-    auto client = clients_to_be_connected_.front();
-    clients_to_be_connected_.pop();
-    client->connect_to_server();
+  if (client_to_be_connected_) {
+    client_to_be_connected_->connect_to_server();
+    client_to_be_connected_ = nullptr;
+  }
+  
+  std::unique_ptr<BLEAdvertisedDevice> discovered_device;
+  if (discovered_devices_.pop(discovered_device)) {
+    ESP_LOGI(TAG, "Found server '%s'.", discovered_device->toString().c_str());
+    auto it = registered_clients_.find(discovered_device->getName());
+    if (it != registered_clients_.end() && !it->second->is_connected()) {
+      it->second->set_server_handle(discovered_device);
+      client_to_be_connected_ = it->second;
+    }
+    discovered_device.reset();
+  }
+
+  ESP32BLENotification n;
+  if (handlersToCall_.pop(n)) {
+    ESP32BLEScanner::handlers_[n.handle](n.data, n.length);
   }
 
   unsigned long current_time = millis();
-  if (current_time - time_of_last_scan_ > scan_period_) {
+  if (!discovered_device && (current_time - time_of_last_scan_) > scan_period_) {
     time_of_last_scan_ = current_time;
     start_scan();
   }
@@ -118,17 +133,21 @@ void ESP32BLEScanner::register_client(ESP32BLEClient* client) {
 
 void ESP32BLEScanner::start_scan() {
   ESP_LOGI(TAG, "Start scanning ...");
-  scanner_handle_->start(10, false);
+  scanner_handle_->clearResults();
+  scanner_handle_->start(20, nullptr, true);
 }
 
 void ESP32BLEScanner::onResult(BLEAdvertisedDevice advertisedDevice) {
-  ESP_LOGI(TAG, "Found server '%s'.", advertisedDevice.getName().c_str());
-  auto it = registered_clients_.find(advertisedDevice.getName());
-  if (it == registered_clients_.end() || it->second->is_connected())
-    return;
+  scanner_handle_->stop();
+  if (!discovered_devices_.push(std::unique_ptr<BLEAdvertisedDevice>(new BLEAdvertisedDevice(advertisedDevice)))) {
+    ESP_LOGW(TAG, "Scanned Value droped");
+  }
+}
 
-  it->second->set_server_handle(advertisedDevice);
-  clients_to_be_connected_.push(it->second);
+void ESP32BLEScanner::onNotify(BLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
+  if (!ESP32BLEScanner::handlersToCall_.push({characteristic->getHandle(), data, length, isNotify})) {
+    ESP_LOGW(TAG, "Value droped");
+  }
 }
 }  // namespace esp32_ble_scanner
 }  // namespace esphome

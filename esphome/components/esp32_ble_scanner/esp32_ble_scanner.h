@@ -1,21 +1,83 @@
 #pragma once
 
 #include "esphome/core/component.h"
-#include "BLEDevice.h"
-#include <unordered_map>
-#include <queue>
-#include <string>
 
 #ifdef ARDUINO_ARCH_ESP32
+
+#include "BLEDevice.h"
+#include <unordered_map>
+#include <string>
+#include <memory>
+#include <freertos/task.h>
+
 
 namespace esphome {
 namespace esp32_ble_scanner {
 using ESP32BLENotificationHandler = std::function<void(uint8_t* data, size_t length)>;
 
+template<typename T>
+class RingBuffer {
+  T* data = nullptr;
+  size_t r_idx = 0;
+  size_t w_idx = 0;
+  size_t capacity = 0;
+  size_t size = 0;
+  SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+
+ public:
+  RingBuffer(size_t cap) {
+    data = new T[cap];
+    capacity = cap;
+  }
+
+  ~RingBuffer() {
+    delete[] data;
+  }
+  
+  bool push(T&& val) {
+    if (!xSemaphoreTake(lock, 5L / portTICK_PERIOD_MS)) return false;
+
+    if (size == capacity) {
+      xSemaphoreGive(lock);
+      return false;
+    }
+
+    data[w_idx] = std::move(val);
+    w_idx = (w_idx + 1) % capacity;
+    size++;
+    
+    xSemaphoreGive(lock);
+    return true;
+  }
+
+  bool pop(T& val) {
+    if (!xSemaphoreTake(lock, 0)) return false;
+
+    if (size == 0) {
+      xSemaphoreGive(lock);
+      return false;
+    }
+
+    val = std::move(data[r_idx]);
+    r_idx = (r_idx + 1) % capacity;
+    size--;
+
+    xSemaphoreGive(lock);
+    return true;
+  }
+};
+
+struct ESP32BLENotification {
+  uint16_t handle;
+  uint8_t* data; 
+  size_t length;
+  bool isNotify;
+};
+
 class ESP32BLEClient {
  public:
   virtual const std::string& get_server_name() const = 0;
-  virtual void set_server_handle(BLEAdvertisedDevice& s) = 0;
+  virtual void set_server_handle(std::unique_ptr<BLEAdvertisedDevice>& s) = 0;
   virtual bool connect_to_server() = 0;
   virtual bool is_connected() const = 0;
 };
@@ -24,7 +86,7 @@ class ESP32BLENotificationSubscriber : public ESP32BLEClient, public BLEClientCa
  public:
   ESP32BLENotificationSubscriber(const std::string& server_name);
   const std::string& get_server_name() const override;
-  void set_server_handle(BLEAdvertisedDevice& server_handle) override;
+  void set_server_handle(std::unique_ptr<BLEAdvertisedDevice>& server_handle) override;
   bool connect_to_server() override;
   bool is_connected() const override;
 
@@ -39,11 +101,8 @@ class ESP32BLENotificationSubscriber : public ESP32BLEClient, public BLEClientCa
   std::unordered_map<std::string, std::unordered_map<std::string, ESP32BLENotificationHandler>> subscriptions_;
   std::string const server_name_;
   BLEClient* const client_;
-  BLEAdvertisedDevice* server_handle_ = nullptr;
+  std::unique_ptr<BLEAdvertisedDevice> server_handle_;
   bool connected_ = false;
-
-  static std::unordered_map<uint16_t, ESP32BLENotificationHandler> handlers_;
-  static void notifyCallback(BLERemoteCharacteristic*, uint8_t*, size_t, bool);
 };
 
 class ESP32BLEScanner: public Component, public BLEAdvertisedDeviceCallbacks {
@@ -64,9 +123,15 @@ class ESP32BLEScanner: public Component, public BLEAdvertisedDeviceCallbacks {
   const bool scan_active_;
 
   std::unordered_map<std::string, ESP32BLEClient*> registered_clients_;
-  std::queue<ESP32BLEClient*> clients_to_be_connected_;
+  ESP32BLEClient* client_to_be_connected_ = nullptr;
+  RingBuffer<std::unique_ptr<BLEAdvertisedDevice>> discovered_devices_ = RingBuffer<std::unique_ptr<BLEAdvertisedDevice>>(5);
   unsigned long time_of_last_scan_;
   BLEScan* scanner_handle_ = nullptr;
+
+ public:
+  static std::unordered_map<uint16_t, ESP32BLENotificationHandler> handlers_;
+  static RingBuffer<ESP32BLENotification> handlersToCall_;
+  static void onNotify(BLERemoteCharacteristic*, uint8_t*, size_t, bool);
 };
 }  // namespace esp32_ble_scanner
 }  // namespace esphome
